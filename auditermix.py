@@ -61,7 +61,8 @@ _MUTED = re.compile(
     r"|Signature solving failed"
     r"|n challenge solving failed"
     r"|Skipping unsupported client"
-    r"|has already been recorded)",
+    r"|has already been recorded"
+    r"|DRM protected)",             # handled cleanly as a result state
     re.IGNORECASE,
 )
 
@@ -71,6 +72,8 @@ _JS_RE = re.compile(
     r"|Remote components challenge solver)",
     re.IGNORECASE,
 )
+
+_DRM_RE = re.compile(r"DRM.?protected|drm", re.IGNORECASE)
 
 _js_warned = False   # surface JS-challenge hint only once per session
 
@@ -358,28 +361,121 @@ def collect_urls() -> list[str]:
 #  QUEUE DISPLAY
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  LIVE QUEUE — in-place updating queue panel
+#  Uses ANSI cursor-up to overwrite rows instead of re-printing below.
+#  Falls back to plain printing on non-TTY output (piped / redirected).
+# ══════════════════════════════════════════════════════════════════════════════
+
 _ICONS: dict[str, str] = {
     "pending": smoke("○"),
     "active":  orange("◆"),
     "done":    green("✓"),
     "skipped": smoke("◇"),
+    "drm":     red("⊘"),
     "error":   red("✗"),
 }
 
-def print_queue(urls: list[str], states: dict[int, str]) -> None:
-    _ln()
-    for i, url in enumerate(urls):
+_NOTES: dict[str, str] = {
+    "skipped": smoke("  already in library"),
+    "drm":     red("  DRM protected"),
+    "error":   smoke("  failed"),
+}
+
+
+class _NLCounter:
+    """Thin sys.stdout wrapper that counts newlines written below the queue."""
+
+    def __init__(self):
+        self._orig  = sys.stdout
+        self.count  = 0
+
+    def write(self, s: str) -> int:
+        self.count += s.count("\n")
+        return self._orig.write(s)
+
+    def flush(self):            return self._orig.flush()
+    def isatty(self) -> bool:   return self._orig.isatty()
+    def fileno(self) -> int:    return self._orig.fileno()
+    def __getattr__(self, n):   return getattr(self._orig, n)
+
+
+class LiveQueue:
+    """
+    Renders a queue list once, then updates icons in-place after each track.
+
+    Usage:
+        q = LiveQueue(urls)
+        q.draw(states)          # initial render
+        ...download track 0...
+        q.update(states)        # jumps cursor back up and redraws
+        ...download track 1...
+        q.update(states)
+    """
+
+    def __init__(self, urls: list[str]) -> None:
+        self.urls       = urls
+        self._height    = 0          # lines in the queue block
+        self._counter   = _NLCounter()
+        self._has_drawn = False
+
+    def _row(self, i: int, states: dict[int, str]) -> str:
         state = states.get(i, "pending")
         icon  = _ICONS[state]
+        url   = self.urls[i]
         label = url if len(url) <= 54 else url[:51] + "…"
-        note  = smoke("  already in library") if state == "skipped" else ""
+        note  = _NOTES.get(state, "")
         text  = (
-            white(label)  if state == "active"  else
-            green(label)  if state == "done"    else
+            white(label)  if state == "active" else
+            green(label)  if state == "done"   else
             smoke(label)
         )
-        print(f"  {icon}  {text}{note}")
-    _ln()
+        return f"  {icon}  {text}{note}"
+
+    def draw(self, states: dict[int, str]) -> None:
+        """Initial draw — call once before the download loop."""
+        lines = [""] + [self._row(i, states) for i in range(len(self.urls))] + [""]
+        for line in lines:
+            print(line)
+        self._height    = len(lines)
+        self._has_drawn = True
+
+        # Install the newline counter AFTER printing the queue
+        if _TTY:
+            sys.stdout = self._counter
+            self._counter.count = 0
+
+    def update(self, states: dict[int, str]) -> None:
+        """Move cursor up, redraw queue rows in-place, move back down."""
+        if not _TTY or not self._has_drawn:
+            # Non-TTY or not yet drawn — just skip (don't spam)
+            return
+
+        lines_below = self._counter.count
+        total_up    = lines_below + self._height
+
+        # Restore real stdout for the cursor escape writes
+        sys.stdout = self._counter._orig
+
+        if total_up > 0:
+            sys.stdout.write(f"\033[{total_up}A")   # move cursor up
+
+        rows = [""] + [self._row(i, states) for i in range(len(self.urls))] + [""]
+        for row in rows:
+            sys.stdout.write(f"\r\033[K{row}\n")    # clear line, write new content
+
+        if lines_below > 0:
+            sys.stdout.write(f"\033[{lines_below}B")   # move back down
+        sys.stdout.flush()
+
+        # Re-install counter (reset count to lines_below — we're back at same pos)
+        self._counter.count = lines_below
+        sys.stdout = self._counter
+
+    def restore(self) -> None:
+        """Restore real stdout after the download loop ends."""
+        if _TTY and sys.stdout is self._counter:
+            sys.stdout = self._counter._orig
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -538,8 +634,12 @@ def download_one(url: str, cfg: dict, archive_path: Path | None) -> str:
     except SystemExit as exc:
         result = "skipped" if exc.code == 101 else "error"
     except Exception as exc:
-        _print_error(str(exc))
-        result = "error"
+        msg = str(exc)
+        if _DRM_RE.search(msg):
+            result = "drm"
+        else:
+            _print_error(msg)
+            result = "error"
 
     _ln()
     if result == "done":
@@ -548,6 +648,8 @@ def download_one(url: str, cfg: dict, archive_path: Path | None) -> str:
         print(f"  {green('✓')}  {smoke('saved to')}  {white(str(music_dir))}")
     elif result == "skipped":
         print(f"  {smoke('◇')}  {smoke('already in library — skipped')}")
+    elif result == "drm":
+        print(f"  {red('⊘')}  {smoke('DRM protected — cannot download')}")
     else:
         _print_error("download failed")
 
@@ -561,6 +663,7 @@ def download_one(url: str, cfg: dict, archive_path: Path | None) -> str:
 def print_summary(states: dict[int, str]) -> None:
     done    = sum(1 for s in states.values() if s == "done")
     skipped = sum(1 for s in states.values() if s == "skipped")
+    drm     = sum(1 for s in states.values() if s == "drm")
     errors  = sum(1 for s in states.values() if s == "error")
 
     _rule()
@@ -569,6 +672,7 @@ def print_summary(states: dict[int, str]) -> None:
     _ln()
     if done:    print(f"  {green('✓')}  {bold(str(done))}  {smoke('downloaded')}")
     if skipped: print(f"  {smoke('◇')}  {bold(str(skipped))}  {smoke('already in library')}")
+    if drm:     print(f"  {red('⊘')}  {bold(str(drm))}  {smoke('DRM protected')}")
     if errors:  print(f"  {red('✗')}  {bold(str(errors))}  {smoke('failed')}")
     _ln()
     print(f"  {smoke('library')}  {white(str(get_music_dir()))}")
@@ -611,16 +715,21 @@ def main() -> None:
     archive_path = get_archive_path() if cfg["archive"] else None
     states: dict[int, str] = {}
 
+    # ── Draw queue once, then update it in-place throughout ──────────────────
+    queue = LiveQueue(urls)
+    queue.draw(states)
+    _rule()
+    _ln()
+
     for i, url in enumerate(urls):
         states[i] = "active"
-        print_queue(urls, states)
-        _rule()
-        _ln()
+        queue.update(states)      # ← cursor jumps up, redraws queue, comes back
 
         try:
             states[i] = download_one(url, cfg, archive_path)
         except KeyboardInterrupt:
             states[i] = "error"
+            queue.restore()
             print(f"\n\n  {smoke('cancelled.')}\n")
             break
 
@@ -628,6 +737,9 @@ def main() -> None:
         _rule()
         _ln()
 
+    queue.restore()              # ← hand stdout back before summary
+    queue.update(states)         # ← final state: all icons settled
+    _ln()
     print_summary(states)
 
 
