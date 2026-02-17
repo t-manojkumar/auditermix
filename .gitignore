@@ -1,0 +1,37 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.spec
+
+# PyInstaller output
+dist/
+build/
+
+# Generated launchers (created by install scripts)
+run.bat
+run.sh
+auditermix.command
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Windows
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# User-specific archive (not shared)
+downloaded.txt
+*.txt.bak
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
